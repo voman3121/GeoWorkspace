@@ -16,6 +16,7 @@ public class DBServer {
             // Port already in use = H2 jar is already running externally, that's fine
             System.out.println("Port 8082 already in use — connecting to existing H2 server.");
         }
+
     }
 
     public static void stop() {

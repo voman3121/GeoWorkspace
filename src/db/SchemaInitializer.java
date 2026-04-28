@@ -12,9 +12,13 @@ public class SchemaInitializer {
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS nodes (
                     id IDENTITY PRIMARY KEY,
-                    x DOUBLE NOT NULL,
-                    y DOUBLE NOT NULL,
-                    label VARCHAR(100)
+                    grid_x INT NOT NULL,
+                    grid_y INT NOT NULL,
+                    screen_x DOUBLE NOT NULL,
+                    screen_y DOUBLE NOT NULL,
+                    label VARCHAR(100) NOT NULL,
+                    degree INT DEFAULT 0,
+                    adjacent_nodes VARCHAR(100) DEFAULT ''
                 )
             """);
 
@@ -23,18 +27,9 @@ public class SchemaInitializer {
                     id IDENTITY PRIMARY KEY,
                     node_a_id BIGINT NOT NULL,
                     node_b_id BIGINT NOT NULL,
-                    FOREIGN KEY (node_a_id) REFERENCES nodes(id),
-                    FOREIGN KEY (node_b_id) REFERENCES nodes(id)
-                )
-            """);
-
-            stmt.execute("""
-                CREATE TABLE IF NOT EXISTS adjacency (
-                    node_id BIGINT NOT NULL,
-                    adjacent_node_id BIGINT NOT NULL,
-                    PRIMARY KEY (node_id, adjacent_node_id),
-                    FOREIGN KEY (node_id) REFERENCES nodes(id),
-                    FOREIGN KEY (adjacent_node_id) REFERENCES nodes(id)
+                    length DOUBLE NOT NULL,
+                    FOREIGN KEY (node_a_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (node_b_id) REFERENCES nodes(id) ON DELETE CASCADE
                 )
             """);
         }

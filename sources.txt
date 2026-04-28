@@ -2,7 +2,6 @@ C:\Users\USER\eclipse-workspace\GeoWorkspace\src\app\Main.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\DBConnection.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\DBServer.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\SchemaInitializer.java
-C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\dao\AdjacencyDAO.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\dao\EdgeDAO.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\db\dao\NodeDAO.java
 C:\Users\USER\eclipse-workspace\GeoWorkspace\src\model\Edge.java

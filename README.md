@@ -19,7 +19,7 @@ Place nodes, draw edges, form shapes, run boolean operations, and inspect all da
 ## Prerequisites
 
 - **Java 17+** — download from [adoptium.net](https://adoptium.net)
-- **H2 JAR** — download `h2-2.4.240.jar` and place it in the `lib/` folder of the project
+- **H2 JAR** — download `h2-2.4.240.jar` 
 
 Verify your Java version:
 ```
@@ -58,11 +58,14 @@ GeoWorkspace/
 ├── sources.txt                <- list of all .java files for javac
 └── README.md
 ```
-
-
----
-
 ## Running the App
+
+First clone the repository and move into the project directory.
+
+```bash
+git clone https://github.com/voman3121/GeoWorkspace.git
+cd GeoWorkspace
+```
 
 Three steps, each in its own terminal. **Do them in this order.**
 
@@ -73,65 +76,66 @@ Three steps, each in its own terminal. **Do them in this order.**
 Open **Terminal 1** and run:
 
 **Windows:**
-```
+```bash
 java -jar "C:\Users\USER\Desktop\h2-2.4.240.jar" -tcp -tcpPort 9092 -tcpAllowOthers -web -webPort 8082 -webAllowOthers
 ```
 
 **Mac / Linux:**
-```
+```bash
 java -jar ~/Downloads/h2-2.4.240.jar -tcp -tcpPort 9092 -tcpAllowOthers -web -webPort 8082 -webAllowOthers
 ```
 
 You should see:
-```
+
+```text
 TCP server running at tcp://localhost:9092 (others can connect)
 Web Console server running at http://localhost:8082
 ```
 
-**Keep this terminal open for the whole session.** Closing it kills the database.
+**Keep this terminal open for the whole session.** Closing it stops the database server.
 
 ---
 
 ### Step 2 — Compile
 
-Open **Terminal 2**, go to the project root, and compile:
+Open **Terminal 2**, move into the cloned project folder, and compile:
 
 **Windows:**
-```
-cd C:\Users\USER\eclipse-workspace\GeoWorkspace
+```bash
+cd GeoWorkspace
 rmdir /s /q out
 mkdir out
 javac -cp "lib/h2-2.4.240.jar" -d out @sources.txt
 ```
 
 **Mac / Linux:**
-```
-cd ~/path/to/GeoWorkspace
-rm -rf out && mkdir out
+```bash
+cd GeoWorkspace
+rm -rf out
+mkdir out
 javac -cp "lib/h2-2.4.240.jar" -d out @sources.txt
 ```
-
-No output means success. Errors will be printed inline.
 
 ---
 
 ### Step 3 — Run
 
-In the same **Terminal 2**:
+In the same terminal:
 
 **Windows:**
-```
+```bash
 java -cp "out;lib/h2-2.4.240.jar" app.Main
 ```
 
 **Mac / Linux:**
-```
+```bash
 java -cp "out:lib/h2-2.4.240.jar" app.Main
 ```
 
-The GeoWorkspace window opens. The terminal will print DB activity as you interact.
+The GeoWorkspace application window should now launch.
 
 ---
+
 
 ### Step 4 (Optional) — Inspect the Database in the Browser
 

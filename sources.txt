@@ -15,3 +15,4 @@ src/ui/ShapeValidator.java
 src/ui/UndoManager.java
 src/ui/HoverTooltipManager.java
 src/ui/ImageTracer.java
+src/ui/AerofoilMesher.java

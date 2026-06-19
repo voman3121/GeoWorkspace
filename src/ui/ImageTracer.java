@@ -7,351 +7,252 @@ import model.Edge;
 import model.Node;
 import model.Shape;
 
-import javax.imageio.ImageIO;
+import org.opencv.core.*;
+import org.opencv.imgcodecs.Imgcodecs;
+import org.opencv.imgproc.Imgproc;
+
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
-import java.awt.event.*;
-import java.awt.geom.*;
-import java.awt.image.*;
+import java.awt.geom.Path2D;
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 
 /**
- * Image auto-tracer.
- *
- * Pipeline:
- *  1. Load image
- *  2. Greyscale + contrast boost
- *  3. Gaussian blur (noise reduction)
- *  4. Canny edge detection (Sobel gradient + NMS + hysteresis)
- *  5. Probabilistic Hough line transform → line segments
- *  6. Circular Hough transform → circles/arcs
- *  7. Merge near-duplicate lines / snap endpoints
- *  8. Place nodes at endpoints + intersections
- *  9. Draw edges between connected nodes
- * 10. Write everything to the DB
+ * Image auto-tracer powered by OpenCV.
+ * Commit opens a brand-new WorkspaceFrame (separate DB-backed workspace window)
+ * rather than touching whatever the user already has open.
  */
 public class ImageTracer {
 
-    // ── tuning constants ──────────────────────────────────────────────────────
-    private static final int    CANNY_LOW        = 30;
-    private static final int    CANNY_HIGH       = 90;
-    private static final int    HOUGH_THRESHOLD  = 60;   // min votes for a line
-    private static final int    MIN_LINE_LEN     = 25;   // px
-    private static final int    MAX_LINE_GAP     = 12;   // px gap still joined
-    private static final double SNAP_DIST        = 14.0; // px — merge near endpoints
-    private static final int    CIRCLE_MIN_R     = 15;
-    private static final int    CIRCLE_MAX_R     = 300;
-    private static final int    CIRCLE_THRESHOLD = 40;
-
-    // ── world-space scale ─────────────────────────────────────────────────────
-    // Map image pixels → world units so nodes land on grid multiples of 40
-    private static final int GRID = 40;
+    private static final int    HOUGH_MIN_LINE_LEN      = 30;
+    private static final int    HOUGH_MAX_LINE_GAP      = 12;
+    private static final double SNAP_DIST               = 20.0;
+    private static final double COLLINEAR_ANGLE_TOL      = 8.0;
+    private static final double COLLINEAR_DIST_TOL       = 8.0;
+    private static final int    CIRCLE_MIN_R             = 12;
+    private static final int    CIRCLE_MAX_R             = 500;
+    private static final double POLY_APPROX_EPSILON_PCT  = 0.04;
+    private static final int    GRID                     = 40;
+    private static final double ON_EDGE_DIST_TOL         = 8.0;
 
     private final NodeDAO  nodeDAO  = new NodeDAO();
     private final EdgeDAO  edgeDAO  = new EdgeDAO();
     private final ShapeDAO shapeDAO = new ShapeDAO();
 
-    // ── public entry point ────────────────────────────────────────────────────
+    public interface StatusCallback { void update(String msg); }
 
-    /** Called from WorkspacePanel. Shows file picker → processing dialog → commits to DB. */
-    public void run(Component parent, Runnable onDone) {
+    private static boolean openCvLoaded = false;
+    private static synchronized void ensureOpenCvLoaded() {
+        if (openCvLoaded) return;
+        try {
+            System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
+            openCvLoaded = true;
+        } catch (UnsatisfiedLinkError e) {
+            throw new RuntimeException(
+                "OpenCV native library not found.\n"
+                + "Make sure opencv_java*.dll is in your lib/ folder and you launched with:\n"
+                + "  java -Djava.library.path=lib -cp \"...\" app.Main", e);
+        }
+    }
+
+    /** parentCanvas is only used to anchor dialogs — its workspace is never touched. */
+    public void run(Component parentCanvas, Runnable onDone) {
+        ensureOpenCvLoaded();
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Select hand-drawn sketch");
         fc.setFileFilter(new FileNameExtensionFilter(
-                "Images (PNG, JPG, BMP)", "png","jpg","jpeg","bmp"));
-        if (fc.showOpenDialog(parent) != JFileChooser.APPROVE_OPTION) return;
-
-        File file = fc.getSelectedFile();
-        SwingWorker<TraceResult, String> worker = new SwingWorker<>() {
-            JDialog progress;
-            JLabel  statusLabel;
-            JProgressBar bar;
-
-            @Override protected void process(List<String> chunks) {
-                statusLabel.setText(chunks.get(chunks.size()-1));
-            }
-
-            @Override protected TraceResult doInBackground() throws Exception {
-            	return trace(file, msg -> publish(msg));            }
-
-            @Override protected void done() {
-                progress.dispose();
-                try {
-                    TraceResult result = get();
-                    showPreview(parent, result, onDone);
-                } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(parent,
-                        "Trace failed: " + ex.getCause().getMessage(),
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                }
-            }
-
-            // Build progress dialog on EDT before starting
-            { SwingUtilities.invokeLater(() -> {
-                progress = new JDialog((Frame) SwingUtilities.getWindowAncestor(parent),
-                        "Tracing sketch…", true);
-                progress.setLayout(new BorderLayout(10,10));
-                statusLabel = new JLabel("Loading image…", SwingConstants.CENTER);
-                statusLabel.setFont(new Font("Consolas", Font.PLAIN, 12));
-                bar = new JProgressBar(); bar.setIndeterminate(true);
-                progress.add(statusLabel, BorderLayout.CENTER);
-                progress.add(bar, BorderLayout.SOUTH);
-                progress.setSize(340, 100);
-                progress.setLocationRelativeTo(parent);
-                progress.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
-                execute();   // start worker
-                progress.setVisible(true);
-            }); }
-        };
-        // Worker is started inside the Swing init block above
+                "Images (PNG, JPG, BMP)", "png", "jpg", "jpeg", "bmp"));
+        if (fc.showOpenDialog(parentCanvas) != JFileChooser.APPROVE_OPTION) return;
+        runTrace(parentCanvas, fc.getSelectedFile(), onDone);
     }
 
-    // ── processing pipeline ───────────────────────────────────────────────────
+    private void runTrace(Component parent, File file, Runnable onDone) {
+        JDialog prog = new JDialog((Frame) SwingUtilities.getWindowAncestor(parent),
+                "Tracing sketch…", false);
+        JLabel statusLbl = new JLabel("Loading…", SwingConstants.CENTER);
+        statusLbl.setFont(new Font("Consolas", Font.PLAIN, 12));
+        JProgressBar bar = new JProgressBar(); bar.setIndeterminate(true);
+        prog.setLayout(new BorderLayout(8, 8));
+        prog.add(statusLbl, BorderLayout.CENTER);
+        prog.add(bar, BorderLayout.SOUTH);
+        prog.setSize(380, 90);
+        prog.setLocationRelativeTo(parent);
+        prog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        prog.setVisible(true);
 
-    private interface StatusCallback { void update(String msg); }
+        SwingWorker<TraceResult, String> worker = new SwingWorker<>() {
+            @Override protected void process(List<String> chunks) {
+                statusLbl.setText(chunks.get(chunks.size() - 1));
+            }
+            @Override protected TraceResult doInBackground() throws Exception {
+                return trace(file, msg -> publish(msg));
+            }
+            @Override protected void done() {
+                prog.dispose();
+                try {
+                    showPreview(parent, file, get(), onDone);
+                } catch (InterruptedException | ExecutionException ex) {
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    JOptionPane.showMessageDialog(parent,
+                        "Trace failed: " + cause.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                    cause.printStackTrace();
+                }
+            }
+        };
+        worker.execute();
+    }
 
+    // ── pipeline ──────────────────────────────────────────────────────────────
     private TraceResult trace(File file, StatusCallback cb) throws Exception {
         cb.update("Loading image…");
-        BufferedImage src = ImageIO.read(file);
-        if (src == null) throw new Exception("Cannot read image file.");
+        Mat original = Imgcodecs.imread(file.getAbsolutePath());
+        if (original.empty()) throw new Exception("Cannot read image — unsupported format or corrupt file.");
+        int w = original.cols(), h = original.rows();
 
-        // 1. Greyscale
         cb.update("Converting to greyscale…");
-        int w = src.getWidth(), h = src.getHeight();
-        int[][] grey = toGrey(src, w, h);
+        Mat grey = new Mat();
+        Imgproc.cvtColor(original, grey, Imgproc.COLOR_BGR2GRAY);
 
-        // 2. Boost contrast
-        cb.update("Enhancing contrast…");
-        grey = stretchContrast(grey, w, h);
+        cb.update("Denoising (bilateral filter)…");
+        Mat denoised = new Mat();
+        Imgproc.bilateralFilter(grey, denoised, 9, 50, 50);
 
-        // 3. Gaussian blur 5×5
-        cb.update("Applying Gaussian blur…");
-        grey = gaussianBlur(grey, w, h);
+        cb.update("Enhancing contrast (CLAHE)…");
+        Mat enhanced = new Mat();
+        Imgproc.createCLAHE(2.5, new Size(8, 8)).apply(denoised, enhanced);
 
-        // 4. Canny edge detection
-        cb.update("Running Canny edge detection…");
-        boolean[][] edges = canny(grey, w, h);
+        cb.update("Computing adaptive Canny thresholds…");
+        double medianVal = median(enhanced);
+        double lower = Math.max(0, 0.66 * medianVal);
+        double upper = Math.min(255, 1.33 * medianVal);
+        if (upper - lower < 20) { lower = 30; upper = 90; }
 
-        // 5. Hough line transform
-        cb.update("Detecting lines (Hough transform)…");
-        List<int[]> lines = houghLines(edges, w, h);   // each: [x1,y1,x2,y2]
+        cb.update("Canny edge detection…");
+        Mat edges = new Mat();
+        Imgproc.Canny(enhanced, edges, lower, upper, 3, true);
 
-        // 6. Circular Hough
-        cb.update("Detecting circles…");
-        List<int[]> circles = houghCircles(grey, edges, w, h); // each: [cx,cy,r]
+        cb.update("Closing small gaps (morphology)…");
+        Mat closed = new Mat();
+        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+        Imgproc.morphologyEx(edges, closed, Imgproc.MORPH_CLOSE, kernel);
 
-        // 7. Merge/snap lines
-        cb.update("Merging duplicate lines…");
-        lines = mergeLines(lines);
+        cb.update("Detecting lines (probabilistic Hough)…");
+        Mat linesMat = new Mat();
+        double houghThresh = estimateHoughThreshold(w, h);
+        Imgproc.HoughLinesP(closed, linesMat, 1, Math.PI / 180, (int) houghThresh,
+                HOUGH_MIN_LINE_LEN, HOUGH_MAX_LINE_GAP);
+        List<double[]> rawLines = matToLines(linesMat);
 
-        // 8. Build nodes from endpoints + intersections
-        cb.update("Placing nodes…");
-        List<double[]> pts = collectPoints(lines, circles, w, h);
-        pts = snapPoints(pts, SNAP_DIST);
+        cb.update("Detecting circles (Hough gradient)…");
+        Mat circlesMat = new Mat();
+        Imgproc.HoughCircles(enhanced, circlesMat, Imgproc.HOUGH_GRADIENT, 1.0,
+                Math.min(w, h) / 16.0, 80, 35, CIRCLE_MIN_R, CIRCLE_MAX_R);
+        List<double[]> circles = matToCircles(circlesMat);
 
-        return new TraceResult(src, w, h, lines, circles, pts);
+        cb.update("Finding contours & corners…");
+        List<MatOfPoint> contours = new ArrayList<>();
+        Mat hierarchy = new Mat();
+        Imgproc.findContours(closed, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE);
+        List<List<double[]>> polygons = approximatePolygons(contours);
+
+        cb.update("Merging duplicate & collinear lines…");
+        rawLines = mergeCollinear(rawLines);
+        rawLines = removeLinesInsideCircles(rawLines, circles);
+
+        cb.update("Fusing contour corners with line endpoints…");
+        List<double[]> nodePoints = fusePoints(rawLines, polygons, circles);
+        nodePoints = snapPoints(nodePoints);
+
+        cb.update("Removing interior ghost nodes…");
+        nodePoints = removeInteriorPoints(nodePoints, rawLines);
+
+        cb.update("Building shape candidates…");
+        List<ShapeCandidate> shapeCandidates = buildShapeCandidates(polygons, nodePoints);
+
+        original.release(); grey.release(); denoised.release(); enhanced.release();
+        edges.release(); closed.release(); linesMat.release(); circlesMat.release();
+        hierarchy.release();
+
+        BufferedImage previewImg = matToBufferedImage(Imgcodecs.imread(file.getAbsolutePath()));
+        return new TraceResult(previewImg, w, h, rawLines, circles, nodePoints, shapeCandidates);
     }
 
-    // ── greyscale ─────────────────────────────────────────────────────────────
-
-    private int[][] toGrey(BufferedImage img, int w, int h) {
-        int[][] g = new int[h][w];
-        for (int y=0; y<h; y++)
-            for (int x=0; x<w; x++) {
-                Color c = new Color(img.getRGB(x,y), true);
-                g[y][x] = (int)(0.299*c.getRed() + 0.587*c.getGreen() + 0.114*c.getBlue());
-            }
-        return g;
+    private double estimateHoughThreshold(int w, int h) {
+        double diag = Math.hypot(w, h);
+        return Math.max(25, Math.min(80, diag / 14.0));
     }
 
-    private int[][] stretchContrast(int[][] g, int w, int h) {
-        int min=255, max=0;
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) { min=Math.min(min,g[y][x]); max=Math.max(max,g[y][x]); }
-        if (max==min) return g;
-        int[][] out=new int[h][w];
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) out[y][x]=(g[y][x]-min)*255/(max-min);
-        return out;
+    private double median(Mat grey) {
+        Mat hist = new Mat();
+        MatOfInt histSize = new MatOfInt(256);
+        MatOfFloat range = new MatOfFloat(0, 256);
+        Imgproc.calcHist(List.of(grey), new MatOfInt(0), new Mat(), hist, histSize, range);
+        double total = grey.rows() * grey.cols();
+        double sum = 0;
+        for (int i = 0; i < 256; i++) {
+            sum += hist.get(i, 0)[0];
+            if (sum >= total / 2.0) return i;
+        }
+        return 128;
     }
 
-    // ── Gaussian blur 5×5 ─────────────────────────────────────────────────────
-
-    private static final double[] GAUSS5 = {
-        2,4,5,4,2, 4,9,12,9,4, 5,12,15,12,5, 4,9,12,9,4, 2,4,5,4,2
-    };
-    private static final double GAUSS5_SUM = 159.0;
-
-    private int[][] gaussianBlur(int[][] g, int w, int h) {
-        int[][] out=new int[h][w];
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) {
-            double sum=0;
-            for (int ky=-2;ky<=2;ky++) for (int kx=-2;kx<=2;kx++) {
-                int ny=Math.max(0,Math.min(h-1,y+ky));
-                int nx=Math.max(0,Math.min(w-1,x+kx));
-                sum+=g[ny][nx]*GAUSS5[(ky+2)*5+(kx+2)];
-            }
-            out[y][x]=(int)(sum/GAUSS5_SUM);
+    private List<double[]> matToLines(Mat linesMat) {
+        List<double[]> out = new ArrayList<>();
+        for (int i = 0; i < linesMat.rows(); i++) {
+            double[] v = linesMat.get(i, 0);
+            out.add(new double[]{v[0], v[1], v[2], v[3]});
         }
         return out;
     }
 
-    // ── Canny edge detection ──────────────────────────────────────────────────
+    private List<double[]> matToCircles(Mat circlesMat) {
+        List<double[]> out = new ArrayList<>();
+        if (circlesMat.cols() == 0) return out;
+        float[] data = new float[(int) (circlesMat.total() * circlesMat.channels())];
+        circlesMat.get(0, 0, data);
+        for (int i = 0; i < data.length; i += 3)
+            out.add(new double[]{data[i], data[i + 1], data[i + 2]});
+        return out;
+    }
 
-    private boolean[][] canny(int[][] g, int w, int h) {
-        // Sobel gradients
-        double[][] mag=new double[h][w];
-        double[][] ang=new double[h][w];
-        int[] sx={-1,0,1,-2,0,2,-1,0,1};
-        int[] sy={-1,-2,-1,0,0,0,1,2,1};
-        for (int y=1;y<h-1;y++) for (int x=1;x<w-1;x++) {
-            double gx=0,gy=0;
-            for (int k=0;k<9;k++){int dy=k/3-1,dx=k%3-1;gx+=g[y+dy][x+dx]*sx[k];gy+=g[y+dy][x+dx]*sy[k];}
-            mag[y][x]=Math.hypot(gx,gy);
-            ang[y][x]=Math.toDegrees(Math.atan2(gy,gx));
+    private List<List<double[]>> approximatePolygons(List<MatOfPoint> contours) {
+        List<List<double[]>> polys = new ArrayList<>();
+        for (MatOfPoint contour : contours) {
+            double area = Imgproc.contourArea(contour);
+            if (area < 200) continue;
+            MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
+            double perimeter = Imgproc.arcLength(contour2f, true);
+            MatOfPoint2f approx = new MatOfPoint2f();
+            Imgproc.approxPolyDP(contour2f, approx, POLY_APPROX_EPSILON_PCT * perimeter, true);
+            org.opencv.core.Point[] pts = approx.toArray();
+            if (pts.length >= 3 && pts.length <= 12) {
+                List<double[]> poly = new ArrayList<>();
+                for (org.opencv.core.Point p : pts) poly.add(new double[]{p.x, p.y});
+                polys.add(poly);
+            }
+            contour2f.release(); approx.release();
         }
+        return polys;
+    }
 
-        // Non-maximum suppression
-        double[][] nms=new double[h][w];
-        for (int y=1;y<h-1;y++) for (int x=1;x<w-1;x++) {
-            double a=ang[y][x]; double m=mag[y][x];
-            double m1,m2;
-            if ((a>=-22.5&&a<22.5)||(a>=157.5||a<-157.5))      { m1=mag[y][x-1]; m2=mag[y][x+1]; }
-            else if ((a>=22.5&&a<67.5)||(a>=-157.5&&a<-112.5)) { m1=mag[y-1][x+1]; m2=mag[y+1][x-1]; }
-            else if ((a>=67.5&&a<112.5)||(a>=-112.5&&a<-67.5)) { m1=mag[y-1][x]; m2=mag[y+1][x]; }
-            else                                                  { m1=mag[y-1][x-1]; m2=mag[y+1][x+1]; }
-            nms[y][x]=(m>=m1&&m>=m2)?m:0;
-        }
-
-        // Double threshold + hysteresis
-        boolean[][] strong=new boolean[h][w], weak=new boolean[h][w];
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) {
-            if (nms[y][x]>=CANNY_HIGH) strong[y][x]=true;
-            else if (nms[y][x]>=CANNY_LOW) weak[y][x]=true;
-        }
-        // Connect weak to strong
-        boolean[][] out=new boolean[h][w];
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) if(strong[y][x]) out[y][x]=true;
-        boolean changed=true;
+    private List<double[]> mergeCollinear(List<double[]> lines) {
+        List<double[]> merged = new ArrayList<>(lines);
+        boolean changed = true;
         while (changed) {
-            changed=false;
-            for (int y=1;y<h-1;y++) for (int x=1;x<w-1;x++) {
-                if (!out[y][x]&&weak[y][x]) {
-                    boolean nb=false;
-                    for (int dy=-1;dy<=1&&!nb;dy++) for(int dx=-1;dx<=1&&!nb;dx++) if(out[y+dy][x+dx])nb=true;
-                    if (nb){out[y][x]=true;changed=true;}
-                }
-            }
-        }
-        return out;
-    }
-
-    // ── Probabilistic Hough line transform ───────────────────────────────────
-
-    private List<int[]> houghLines(boolean[][] edges, int w, int h) {
-        // Standard Hough: accumulate r-theta, then trace segments
-        int diagLen=(int)Math.ceil(Math.hypot(w,h));
-        int numAngles=180;
-        int[][] acc=new int[numAngles][2*diagLen];
-        double[] cosA=new double[numAngles], sinA=new double[numAngles];
-        for (int t=0;t<numAngles;t++){double r=Math.toRadians(t);cosA[t]=Math.cos(r);sinA[t]=Math.sin(r);}
-
-        // Accumulate
-        for (int y=0;y<h;y++) for (int x=0;x<w;x++) if(edges[y][x])
-            for (int t=0;t<numAngles;t++){
-                int r=(int)Math.round(x*cosA[t]+y*sinA[t])+diagLen;
-                if(r>=0&&r<2*diagLen) acc[t][r]++;
-            }
-
-        // Find peaks above threshold
-        List<int[]> segments=new ArrayList<>();
-        for (int t=0;t<numAngles;t++) for (int r=0;r<2*diagLen;r++) {
-            if (acc[t][r]<HOUGH_THRESHOLD) continue;
-            // Trace segment along this (theta,r) line
-            double theta=Math.toRadians(t);
-            double rVal=r-diagLen;
-            double ct=cosA[t],st=sinA[t];
-            // perpendicular direction
-            int[] seg=traceSegment(edges,w,h,theta,rVal,ct,st);
-            if (seg!=null) segments.add(seg);
-        }
-        return segments;
-    }
-
-    private int[] traceSegment(boolean[][] edges,int w,int h,double theta,double rho,double ct,double st) {
-        // Walk along the line and find the longest contiguous edge run
-        int x0=(int)Math.round(rho*ct), y0=(int)Math.round(rho*st);
-        // direction along the line
-        double dx=-st, dy=ct;
-        if (Math.abs(dx)<Math.abs(dy)){dx=-st;dy=ct;}else{dx=-st;dy=ct;}
-
-        // Scan from -diagLen to +diagLen along direction
-        int len=(int)Math.ceil(Math.hypot(w,h));
-        int bestX1=-1,bestY1=-1,bestX2=-1,bestY2=-1,bestLen=0;
-        int curX1=-1,curY1=-1,gap=0,runLen=0;
-
-        for (int i=-len;i<=len;i++){
-            int x=(int)Math.round(x0+i*dx);
-            int y=(int)Math.round(y0+i*dy);
-            if (x<0||x>=w||y<0||y>=h){gap++;continue;}
-            if (edges[y][x]){
-                gap=0; runLen++;
-                if (curX1<0){curX1=x;curY1=y;}
-                if (runLen>bestLen){bestLen=runLen;bestX1=curX1;bestY1=curY1;bestX2=x;bestY2=y;}
-            } else {
-                gap++;
-                if (gap>MAX_LINE_GAP){curX1=-1;curY1=-1;runLen=0;gap=0;}
-            }
-        }
-        if (bestLen<MIN_LINE_LEN) return null;
-        return new int[]{bestX1,bestY1,bestX2,bestY2};
-    }
-
-    // ── Circular Hough transform ──────────────────────────────────────────────
-
-    private List<int[]> houghCircles(int[][] grey, boolean[][] edges, int w, int h) {
-        List<int[]> found=new ArrayList<>();
-        // For each candidate radius, accumulate centre votes
-        for (int r=CIRCLE_MIN_R;r<=Math.min(CIRCLE_MAX_R,Math.min(w,h)/2);r+=4) {
-            int[][] acc=new int[h][w];
-            for (int y=0;y<h;y++) for (int x=0;x<w;x++) if(edges[y][x]) {
-                // vote for all possible centres at distance r
-                for (int angle=0;angle<360;angle+=5) {
-                    double rad=Math.toRadians(angle);
-                    int cx=(int)Math.round(x-r*Math.cos(rad));
-                    int cy=(int)Math.round(y-r*Math.sin(rad));
-                    if (cx>=0&&cx<w&&cy>=0&&cy<h) acc[cy][cx]++;
-                }
-            }
-            // Find peaks
-            for (int cy=r;cy<h-r;cy++) for (int cx=r;cx<w-r;cx++) {
-                if (acc[cy][cx]<CIRCLE_THRESHOLD) continue;
-                // Check not too close to existing circles
-                boolean dup=false;
-                for (int[] c:found) if(Math.hypot(cx-c[0],cy-c[1])<r*0.5){dup=true;break;}
-                if (!dup) found.add(new int[]{cx,cy,r});
-            }
-        }
-        return found;
-    }
-
-    // ── merge near-duplicate lines ────────────────────────────────────────────
-
-    private List<int[]> mergeLines(List<int[]> lines) {
-        List<int[]> merged=new ArrayList<>(lines);
-        boolean changed=true;
-        while (changed) {
-            changed=false;
+            changed = false;
             outer:
-            for (int i=0;i<merged.size();i++) {
-                for (int j=i+1;j<merged.size();j++) {
-                    int[] a=merged.get(i), b=merged.get(j);
-                    if (linesParallelAndClose(a,b)) {
-                        // merge into longer combined line
-                        merged.set(i, combineLine(a,b));
+            for (int i = 0; i < merged.size(); i++) {
+                for (int j = i + 1; j < merged.size(); j++) {
+                    double[] a = merged.get(i), b = merged.get(j);
+                    if (isCollinearAndClose(a, b)) {
+                        merged.set(i, combineLine(a, b));
                         merged.remove(j);
-                        changed=true; break outer;
+                        changed = true;
+                        break outer;
                     }
                 }
             }
@@ -359,53 +260,88 @@ public class ImageTracer {
         return merged;
     }
 
-    private boolean linesParallelAndClose(int[] a, int[] b) {
-        double angA=Math.toDegrees(Math.atan2(a[3]-a[1],a[2]-a[0]));
-        double angB=Math.toDegrees(Math.atan2(b[3]-b[1],b[2]-b[0]));
-        double dAng=Math.abs(angA-angB)%180;
-        if (dAng>10&&dAng<170) return false;
-        // Check endpoint proximity
-        return ptLineDist(b[0],b[1],a[0],a[1],a[2],a[3])<SNAP_DIST*1.5 ||
-               ptLineDist(b[2],b[3],a[0],a[1],a[2],a[3])<SNAP_DIST*1.5;
+    private boolean isCollinearAndClose(double[] a, double[] b) {
+        double angA = Math.toDegrees(Math.atan2(a[3] - a[1], a[2] - a[0]));
+        double angB = Math.toDegrees(Math.atan2(b[3] - b[1], b[2] - b[0]));
+        double dAng = Math.abs(angA - angB) % 180;
+        if (dAng > COLLINEAR_ANGLE_TOL && dAng < 180 - COLLINEAR_ANGLE_TOL) return false;
+        double d1 = ptLineDist(b[0], b[1], a);
+        double d2 = ptLineDist(b[2], b[3], a);
+        return Math.min(d1, d2) < COLLINEAR_DIST_TOL && segmentsOverlapOrClose(a, b);
     }
 
-    private int[] combineLine(int[] a, int[] b) {
-        // Pick the outermost endpoints
-        double[] pts={dist2(a[0],a[1],b[0],b[1]),dist2(a[0],a[1],b[2],b[3]),
-                      dist2(a[2],a[3],b[0],b[1]),dist2(a[2],a[3],b[2],b[3])};
-        int maxIdx=0; for(int i=1;i<4;i++) if(pts[i]>pts[maxIdx]) maxIdx=i;
-        int[][] combos={{a[0],a[1],b[0],b[1]},{a[0],a[1],b[2],b[3]},
-                        {a[2],a[3],b[0],b[1]},{a[2],a[3],b[2],b[3]}};
-        return combos[maxIdx];
+    private boolean segmentsOverlapOrClose(double[] a, double[] b) {
+        double maxGap = SNAP_DIST * 2.5;
+        return dist(a[0],a[1],b[0],b[1]) < maxGap || dist(a[0],a[1],b[2],b[3]) < maxGap ||
+               dist(a[2],a[3],b[0],b[1]) < maxGap || dist(a[2],a[3],b[2],b[3]) < maxGap ||
+               (ptLineDist(b[0],b[1],a) < COLLINEAR_DIST_TOL && ptLineDist(b[2],b[3],a) < COLLINEAR_DIST_TOL);
     }
 
-    // ── collect node positions ─────────────────────────────────────────────────
+    private double[] combineLine(double[] a, double[] b) {
+        double[][] pts = {{a[0],a[1]},{a[2],a[3]},{b[0],b[1]},{b[2],b[3]}};
+        double maxD = -1; int bi=0, bj=0;
+        for (int i=0;i<4;i++) for (int j=i+1;j<4;j++) {
+            double d = dist(pts[i][0],pts[i][1],pts[j][0],pts[j][1]);
+            if (d>maxD) { maxD=d; bi=i; bj=j; }
+        }
+        return new double[]{pts[bi][0],pts[bi][1],pts[bj][0],pts[bj][1]};
+    }
 
-    private List<double[]> collectPoints(List<int[]> lines, List<int[]> circles, int w, int h) {
-        List<double[]> pts=new ArrayList<>();
-        // Line endpoints
-        for (int[] l:lines) {
-            pts.add(new double[]{l[0],l[1]});
-            pts.add(new double[]{l[2],l[3]});
+    private List<double[]> removeLinesInsideCircles(List<double[]> lines, List<double[]> circles) {
+        if (circles.isEmpty()) return lines;
+        List<double[]> kept = new ArrayList<>();
+        for (double[] l : lines) {
+            double mx=(l[0]+l[2])/2, my=(l[1]+l[3])/2;
+            boolean onCircle=false;
+            for (double[] c : circles) {
+                double dCenter = dist(mx,my,c[0],c[1]);
+                if (Math.abs(dCenter - c[2]) < c[2]*0.15) { onCircle=true; break; }
+            }
+            if (!onCircle) kept.add(l);
         }
-        // Line-line intersections
-        for (int i=0;i<lines.size();i++) for (int j=i+1;j<lines.size();j++) {
-            double[] pt=lineIntersect(lines.get(i),lines.get(j));
-            if (pt!=null&&pt[0]>=0&&pt[0]<w&&pt[1]>=0&&pt[1]<h) pts.add(pt);
+        return kept;
+    }
+
+    private List<double[]> fusePoints(List<double[]> lines, List<List<double[]>> polygons,
+                                       List<double[]> circles) {
+        List<double[]> pts = new ArrayList<>();
+        for (double[] l : lines) {
+            pts.add(new double[]{l[0], l[1]});
+            pts.add(new double[]{l[2], l[3]});
         }
-        // Circle centres
-        for (int[] c:circles) pts.add(new double[]{c[0],c[1]});
+        for (List<double[]> poly : polygons) pts.addAll(poly);
+        for (double[] c : circles) pts.add(new double[]{c[0], c[1]});
         return pts;
     }
 
-    private List<double[]> snapPoints(List<double[]> pts, double snapDist) {
-        List<double[]> result=new ArrayList<>();
-        for (double[] p:pts) {
+    private List<double[]> removeInteriorPoints(List<double[]> pts, List<double[]> lines) {
+        List<double[]> kept = new ArrayList<>();
+        for (double[] p : pts) {
+            boolean interior = false;
+            for (double[] l : lines) {
+                double segLen = dist(l[0], l[1], l[2], l[3]);
+                if (segLen < 1e-3) continue;
+                double perp = ptLineDist(p[0], p[1], l);
+                if (perp > ON_EDGE_DIST_TOL) continue;
+                double dA = dist(p[0], p[1], l[0], l[1]);
+                double dB = dist(p[0], p[1], l[2], l[3]);
+                if (dA > SNAP_DIST && dB > SNAP_DIST && (dA + dB) < segLen + SNAP_DIST) {
+                    interior = true;
+                    break;
+                }
+            }
+            if (!interior) kept.add(p);
+        }
+        return kept;
+    }
+
+    private List<double[]> snapPoints(List<double[]> pts) {
+        List<double[]> result = new ArrayList<>();
+        for (double[] p : pts) {
             boolean merged=false;
-            for (double[] r:result) {
-                if (Math.hypot(p[0]-r[0],p[1]-r[1])<snapDist) {
-                    r[0]=(r[0]+p[0])/2; r[1]=(r[1]+p[1])/2;
-                    merged=true; break;
+            for (double[] r : result) {
+                if (dist(p[0],p[1],r[0],r[1]) < SNAP_DIST) {
+                    r[0]=(r[0]+p[0])/2; r[1]=(r[1]+p[1])/2; merged=true; break;
                 }
             }
             if (!merged) result.add(new double[]{p[0],p[1]});
@@ -413,234 +349,252 @@ public class ImageTracer {
         return result;
     }
 
-    // ── geometry helpers ──────────────────────────────────────────────────────
-
-    private double ptLineDist(int px,int py,int ax,int ay,int bx,int by) {
-        double dx=bx-ax,dy=by-ay,len2=dx*dx+dy*dy;
-        if(len2==0) return Math.hypot(px-ax,py-ay);
-        double t=Math.max(0,Math.min(1,((px-ax)*dx+(py-ay)*dy)/len2));
-        return Math.hypot(px-(ax+t*dx),py-(ay+t*dy));
-    }
-
-    private double dist2(int x1,int y1,int x2,int y2){return Math.hypot(x1-x2,y1-y2);}
-
-    private double[] lineIntersect(int[] a, int[] b) {
-        double x1=a[0],y1=a[1],x2=a[2],y2=a[3];
-        double x3=b[0],y3=b[1],x4=b[2],y4=b[3];
-        double denom=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);
-        if (Math.abs(denom)<1) return null;
-        double t=((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/denom;
-        if(t<-0.1||t>1.1) return null;
-        return new double[]{x1+t*(x2-x1),y1+t*(y2-y1)};
-    }
-
-    // ── preview dialog ────────────────────────────────────────────────────────
-
-    private void showPreview(Component parent, TraceResult result, Runnable onDone) {
-        JDialog dlg = new JDialog((Frame)SwingUtilities.getWindowAncestor(parent),
-                "Trace Preview — confirm to import", true);
-        dlg.setSize(Math.min(result.w+100,1200), Math.min(result.h+150,800));
-        dlg.setLocationRelativeTo(parent);
-        dlg.setLayout(new BorderLayout(8,8));
-
-        // Preview canvas
-        JPanel preview = new JPanel() {
-            @Override protected void paintComponent(Graphics g) {
-                super.paintComponent(g);
-                Graphics2D g2=(Graphics2D)g;
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,RenderingHints.VALUE_ANTIALIAS_ON);
-
-                // Scale to fit
-                double sx=(double)(getWidth()-20)/result.w;
-                double sy=(double)(getHeight()-20)/result.h;
-                double s=Math.min(sx,sy);
-                int ox=(int)((getWidth()-result.w*s)/2);
-                int oy=(int)((getHeight()-result.h*s)/2);
-
-                // Draw original image dimmed
-                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER,0.30f));
-                g2.drawImage(result.src,(int)(ox),(int)(oy),(int)(result.w*s),(int)(result.h*s),null);
-                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER,1f));
-
-                // Draw detected lines
-                g2.setColor(new Color(0,180,255,200));
-                g2.setStroke(new BasicStroke(1.5f,BasicStroke.CAP_ROUND,BasicStroke.JOIN_ROUND));
-                for (int[] l:result.lines) {
-                    g2.drawLine((int)(ox+l[0]*s),(int)(oy+l[1]*s),
-                                (int)(ox+l[2]*s),(int)(oy+l[3]*s));
-                }
-
-                // Draw detected circles
-                g2.setColor(new Color(0,220,160,200));
-                for (int[] c:result.circles) {
-                    int cx=(int)(ox+c[0]*s),cy=(int)(oy+c[1]*s),r=(int)(c[2]*s);
-                    g2.drawOval(cx-r,cy-r,r*2,r*2);
-                }
-
-                // Draw detected nodes
-                g2.setColor(new Color(255,200,30));
-                for (double[] p:result.points) {
-                    int px=(int)(ox+p[0]*s),py=(int)(oy+p[1]*s);
-                    g2.fillOval(px-4,py-4,8,8);
-                }
+    private List<ShapeCandidate> buildShapeCandidates(List<List<double[]>> polygons, List<double[]> nodePoints) {
+        List<ShapeCandidate> candidates = new ArrayList<>();
+        for (List<double[]> poly : polygons) {
+            List<Integer> nodeIdx = new ArrayList<>();
+            for (double[] corner : poly) {
+                int idx = nearestIdx(nodePoints, corner[0], corner[1]);
+                if (idx >= 0 && !nodeIdx.contains(idx)) nodeIdx.add(idx);
             }
-        };
-        preview.setBackground(new Color(8,10,18));
-        preview.setPreferredSize(new Dimension(result.w, result.h));
-        JScrollPane scroll=new JScrollPane(preview);
-        scroll.setBorder(BorderFactory.createEmptyBorder());
-
-        // Info
-        JLabel info=new JLabel(String.format(
-            "  Detected: %d lines  •  %d circles  •  %d nodes   — click COMMIT to import into workspace",
-            result.lines.size(), result.circles.size(), result.points.size()));
-        info.setFont(new Font("Consolas",Font.PLAIN,11));
-        info.setForeground(new Color(0,185,255));
-        info.setOpaque(true); info.setBackground(new Color(6,8,16));
-        info.setBorder(BorderFactory.createEmptyBorder(6,12,6,12));
-
-        // Sensitivity slider
-        JPanel controls=new JPanel(new FlowLayout(FlowLayout.LEFT,12,4));
-        controls.setBackground(new Color(8,10,18));
-        controls.add(lbl("Sensitivity:"));
-        JSlider sens=new JSlider(10,120,HOUGH_THRESHOLD);
-        sens.setBackground(new Color(8,10,18));
-        sens.setForeground(new Color(0,180,255));
-        controls.add(sens);
-        controls.add(lbl("(lower = more lines)"));
-
-        // Buttons
-        JPanel btnRow=new JPanel(new FlowLayout(FlowLayout.RIGHT,8,4));
-        btnRow.setBackground(new Color(8,10,18));
-        JButton commit=dlgBtn("COMMIT TO DB",new Color(0,100,180));
-        JButton cancel=dlgBtn("CANCEL",new Color(40,40,60));
-        btnRow.add(cancel); btnRow.add(commit);
-
-        JPanel south=new JPanel(new BorderLayout());
-        south.setBackground(new Color(8,10,18));
-        south.add(controls,BorderLayout.CENTER);
-        south.add(btnRow,BorderLayout.EAST);
-
-        dlg.add(info,BorderLayout.NORTH);
-        dlg.add(scroll,BorderLayout.CENTER);
-        dlg.add(south,BorderLayout.SOUTH);
-
-        commit.addActionListener(e->{
-            dlg.dispose();
-            commitToDb(result, parent, onDone);
-        });
-        cancel.addActionListener(e->dlg.dispose());
-
-        dlg.setVisible(true);
-    }
-
-    // ── commit to DB ──────────────────────────────────────────────────────────
-
-    private void commitToDb(TraceResult result, Component parent, Runnable onDone) {
-        // Scale image coordinates → world coordinates
-        // Fit image into a world area of ~1600x1200 world units
-        double targetW = 1600.0, targetH = 1200.0;
-        double scaleX = targetW / result.w;
-        double scaleY = targetH / result.h;
-        double scale  = Math.min(scaleX, scaleY);
-        // Offset so it's centred at origin
-        double offX = -result.w * scale / 2.0;
-        double offY = -result.h * scale / 2.0;
-
-        try {
-            // Insert nodes (snapped to nearest grid point)
-            Map<Integer,Long> ptIdMap=new HashMap<>();
-            List<Node> insertedNodes=new ArrayList<>();
-
-            for (int i=0;i<result.points.size();i++) {
-                double[] p=result.points.get(i);
-                double wx=snap(offX+p[0]*scale);
-                double wy=snap(offY+p[1]*scale);
-                String label="T"+(i+1);
-                Node n=nodeDAO.insert(new Node(wx,wy,label));
-                ptIdMap.put(i,(long)n.getId());
-                insertedNodes.add(n);
+            if (nodeIdx.size() >= 3) {
+                String type = switch (nodeIdx.size()) {
+                    case 3 -> "Triangle";
+                    case 4 -> "Square";
+                    case 5 -> "Pentagon";
+                    case 6 -> "Hexagon";
+                    default -> "Free-Polygon";
+                };
+                candidates.add(new ShapeCandidate(type, nodeIdx));
             }
-
-            // Insert edges for each detected line segment
-            // Find nearest node to each line endpoint and connect them
-            int edgesCreated=0;
-            for (int[] line:result.lines) {
-                double wx1=offX+line[0]*scale, wy1=offY+line[1]*scale;
-                double wx2=offX+line[2]*scale, wy2=offY+line[3]*scale;
-                int ni1=nearestPoint(result.points,line[0],line[1]);
-                int ni2=nearestPoint(result.points,line[2],line[3]);
-                if (ni1<0||ni2<0||ni1==ni2) continue;
-                long idA=ptIdMap.get(ni1), idB=ptIdMap.get(ni2);
-                // Check adjacency limit
-                Node na=nodeDAO.findById(idA), nb=nodeDAO.findById(idB);
-                if(na==null||nb==null) continue;
-                if(na.hasNeighbour(idB)) continue;
-                if(na.firstFreeSlot()<0||nb.firstFreeSlot()<0) continue;
-                double len=Math.hypot(wx2-wx1,wy2-wy1);
-                try {
-                    edgeDAO.insert(new Edge(idA,idB,len));
-                    nodeDAO.addAdjacency(idA,idB);
-                    edgesCreated++;
-                } catch(Exception ex){/* skip if already exists */}
-            }
-
-            // Insert circles as shapes
-            int circlesCreated=0;
-            for (int[] c:result.circles) {
-                double wcx=offX+c[0]*scale;
-                double wcy=offY+c[1]*scale;
-                double wr=c[2]*scale;
-                String label="Circle"+(circlesCreated+1);
-                String extra=wcx+","+wcy+","+wr;
-                Shape s=new Shape(label,"Circle",new long[0],Math.PI*wr*wr,2*Math.PI*wr,extra);
-                shapeDAO.insert(s);
-                circlesCreated++;
-            }
-
-            final int fn=insertedNodes.size(), fe=edgesCreated, fc=circlesCreated;
-            SwingUtilities.invokeLater(()->{ 
-                JOptionPane.showMessageDialog(parent,
-                    "Import complete!\n"+fn+" nodes  •  "+fe+" edges  •  "+fc+" circles\nwritten to database.",
-                    "Done", JOptionPane.INFORMATION_MESSAGE);
-                onDone.run();
-            });
-
-        } catch(Exception ex) {
-            ex.printStackTrace();
-            SwingUtilities.invokeLater(()->JOptionPane.showMessageDialog(parent,
-                "DB error: "+ex.getMessage(),"Error",JOptionPane.ERROR_MESSAGE));
         }
+        return candidates;
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    private double snap(double v){return Math.round(v/GRID)*GRID;}
-
-    private int nearestPoint(List<double[]> pts,int x,int y){
+    private double ptLineDist(double px,double py,double[]l) {
+        double dx=l[2]-l[0], dy=l[3]-l[1], len2=dx*dx+dy*dy;
+        if (len2==0) return dist(px,py,l[0],l[1]);
+        double t=Math.max(0,Math.min(1,((px-l[0])*dx+(py-l[1])*dy)/len2));
+        return dist(px,py,l[0]+t*dx,l[1]+t*dy);
+    }
+    private double dist(double x1,double y1,double x2,double y2){ return Math.hypot(x1-x2,y1-y2); }
+    private int nearestIdx(List<double[]> pts, double x, double y) {
         int best=-1; double bestD=SNAP_DIST*3;
-        for(int i=0;i<pts.size();i++){
-            double d=Math.hypot(pts.get(i)[0]-x,pts.get(i)[1]-y);
-            if(d<bestD){bestD=d;best=i;}
+        for (int i=0;i<pts.size();i++) {
+            double d=dist(pts.get(i)[0],pts.get(i)[1],x,y);
+            if (d<bestD){bestD=d;best=i;}
         }
         return best;
     }
 
-    private JLabel lbl(String t){JLabel l=new JLabel(t);l.setFont(new Font("Consolas",Font.PLAIN,11));l.setForeground(new Color(100,160,210));return l;}
-    private JButton dlgBtn(String t,Color bg){
-        JButton b=new JButton(t);b.setFont(new Font("Consolas",Font.BOLD,11));
-        b.setForeground(Color.WHITE);b.setBackground(bg);b.setBorderPainted(false);b.setFocusPainted(false);b.setOpaque(true);
-        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));return b;
+    private BufferedImage matToBufferedImage(Mat mat) {
+        Mat rgb = new Mat();
+        Imgproc.cvtColor(mat, rgb, Imgproc.COLOR_BGR2RGB);
+        int w = rgb.cols(), h = rgb.rows();
+        byte[] data = new byte[w * h * (int) rgb.elemSize()];
+        rgb.get(0, 0, data);
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        int[] px = new int[w * h];
+        for (int i = 0, j = 0; i < px.length; i++, j += 3) {
+            int r = data[j] & 0xff, g = data[j+1] & 0xff, b = data[j+2] & 0xff;
+            px[i] = (r << 16) | (g << 8) | b;
+        }
+        img.setRGB(0, 0, w, h, px, 0, w);
+        rgb.release();
+        return img;
     }
 
-    // ── result record ─────────────────────────────────────────────────────────
+    // ── preview dialog ────────────────────────────────────────────────────────
+    private void showPreview(Component parent, File file, TraceResult result, Runnable onDone) {
+        JDialog dlg = new JDialog((Frame) SwingUtilities.getWindowAncestor(parent),
+                "Trace Preview — OpenCV pipeline result", true);
+        dlg.setSize(Math.min(result.w + 120, 1280), Math.min(result.h + 200, 880));
+        dlg.setLocationRelativeTo(parent);
+        dlg.setLayout(new BorderLayout(6, 6));
+        dlg.getContentPane().setBackground(new Color(8, 10, 18));
 
+        JPanel canvas = new JPanel() {
+            @Override protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g;
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                double sx = (double)(getWidth()-20)/result.w, sy=(double)(getHeight()-20)/result.h;
+                double s = Math.min(sx, sy);
+                int ox=(int)((getWidth()-result.w*s)/2), oy=(int)((getHeight()-result.h*s)/2);
+
+                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.30f));
+                g2.drawImage(result.src, ox, oy, (int)(result.w*s), (int)(result.h*s), null);
+                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1f));
+
+                g2.setColor(new Color(60, 220, 120, 200));
+                g2.setStroke(new BasicStroke(2.2f));
+                for (ShapeCandidate sc : result.shapes) {
+                    Path2D p = new Path2D.Double();
+                    boolean first=true;
+                    for (int idx : sc.nodeIndices) {
+                        double[] pt = result.points.get(idx);
+                        if (first) { p.moveTo(ox+pt[0]*s, oy+pt[1]*s); first=false; }
+                        else p.lineTo(ox+pt[0]*s, oy+pt[1]*s);
+                    }
+                    p.closePath();
+                    g2.draw(p);
+                }
+
+                g2.setColor(new Color(0, 160, 255, 110));
+                g2.setStroke(new BasicStroke(1.2f));
+                for (double[] l : result.lines)
+                    g2.drawLine((int)(ox+l[0]*s),(int)(oy+l[1]*s),(int)(ox+l[2]*s),(int)(oy+l[3]*s));
+
+                g2.setColor(new Color(255, 140, 0, 220));
+                g2.setStroke(new BasicStroke(2f));
+                for (double[] c : result.circles) {
+                    int cx=(int)(ox+c[0]*s), cy=(int)(oy+c[1]*s), r=(int)(c[2]*s);
+                    g2.drawOval(cx-r, cy-r, r*2, r*2);
+                }
+
+                g2.setColor(new Color(255, 210, 30));
+                for (double[] p : result.points) {
+                    int px=(int)(ox+p[0]*s), py=(int)(oy+p[1]*s);
+                    g2.fillOval(px-5, py-5, 10, 10);
+                }
+            }
+        };
+        canvas.setBackground(new Color(8, 10, 18));
+        JScrollPane scroll = new JScrollPane(canvas);
+        scroll.setBorder(BorderFactory.createEmptyBorder());
+        dlg.add(scroll, BorderLayout.CENTER);
+
+        JLabel info = new JLabel(String.format(
+            "  Detected: %d shapes  •  %d lines  •  %d circles  •  %d nodes   (OpenCV pipeline)",
+            result.shapes.size(), result.lines.size(), result.circles.size(), result.points.size()));
+        info.setFont(new Font("Consolas", Font.PLAIN, 12));
+        info.setForeground(new Color(0, 185, 255));
+        info.setOpaque(true); info.setBackground(new Color(6, 8, 16));
+        info.setBorder(BorderFactory.createEmptyBorder(7, 12, 7, 12));
+        dlg.add(info, BorderLayout.NORTH);
+
+        JPanel south = new JPanel(new BorderLayout(8, 4));
+        south.setBackground(new Color(8, 10, 18));
+        south.setBorder(BorderFactory.createEmptyBorder(6, 12, 8, 12));
+        JLabel legend = new JLabel(
+            "<html><span style='color:#3cdc78'>■</span> shapes &nbsp;"
+            + "<span style='color:#00a0ff'>■</span> lines &nbsp;"
+            + "<span style='color:#ff8c00'>■</span> circles &nbsp;"
+            + "<span style='color:#ffd21e'>●</span> nodes &nbsp; "
+            + "<span style='color:#888'>→ opens in a NEW workspace window</span></html>");
+        legend.setFont(new Font("Consolas", Font.PLAIN, 10));
+        south.add(legend, BorderLayout.WEST);
+
+        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        btnRow.setBackground(new Color(8, 10, 18));
+        JButton cancel = dlgBtn("CANCEL", new Color(35, 35, 50));
+        JButton commit = dlgBtn("COMMIT → NEW WORKSPACE", new Color(0, 110, 190));
+        btnRow.add(cancel); btnRow.add(commit);
+        south.add(btnRow, BorderLayout.EAST);
+        dlg.add(south, BorderLayout.SOUTH);
+
+        cancel.addActionListener(e -> dlg.dispose());
+        commit.addActionListener(e -> { dlg.dispose(); commitToNewWorkspace(result, parent, onDone); });
+        dlg.setVisible(true);
+    }
+
+    // ── commit to a BRAND NEW workspace window (separate DB-backed frame) ─────
+    private void commitToNewWorkspace(TraceResult result, Component parent, Runnable onDone) {
+        double targetW=1600.0, targetH=1200.0;
+        double scale=Math.min(targetW/result.w, targetH/result.h);
+        double offX=-result.w*scale/2.0, offY=-result.h*scale/2.0;
+
+        try {
+            Map<Integer,Long> ptIdMap = new HashMap<>();
+            List<Node> insertedNodes = new ArrayList<>();
+            for (int i=0;i<result.points.size();i++) {
+                double[] p = result.points.get(i);
+                double wx=snap(offX+p[0]*scale), wy=snap(offY+p[1]*scale);
+                Node n = nodeDAO.insert(new Node(wx, wy, "T"+(i+1)));
+                ptIdMap.put(i, n.getId());
+                insertedNodes.add(n);
+            }
+
+            int edgeCount=0;
+            for (double[] line : result.lines) {
+                int i1=nearestIdx(result.points, line[0], line[1]);
+                int i2=nearestIdx(result.points, line[2], line[3]);
+                if (i1<0||i2<0||i1==i2) continue;
+                Long idA=ptIdMap.get(i1), idB=ptIdMap.get(i2);
+                if (idA==null||idB==null) continue;
+                Node na=nodeDAO.findById(idA), nb=nodeDAO.findById(idB);
+                if (na==null||nb==null||na.hasNeighbour(idB)) continue;
+                if (na.firstFreeSlot()<0||nb.firstFreeSlot()<0) continue;
+                double wx1=offX+line[0]*scale, wy1=offY+line[1]*scale;
+                double wx2=offX+line[2]*scale, wy2=offY+line[3]*scale;
+                try {
+                    edgeDAO.insert(new Edge(idA, idB, Math.hypot(wx2-wx1, wy2-wy1)));
+                    nodeDAO.addAdjacency(idA, idB);
+                    edgeCount++;
+                } catch (Exception ignore) {}
+            }
+
+            int shapeCount=0;
+            for (ShapeCandidate sc : result.shapes) {
+                long[] ids = new long[sc.nodeIndices.size()];
+                boolean ok=true;
+                for (int k=0;k<sc.nodeIndices.size();k++) {
+                    Long id = ptIdMap.get(sc.nodeIndices.get(k));
+                    if (id==null) { ok=false; break; }
+                    ids[k]=id;
+                }
+                if (!ok) continue;
+                shapeDAO.insert(new Shape(sc.type+" "+(shapeCount+1), sc.type, ids, 0, 0, ""));
+                shapeCount++;
+            }
+
+            int circleCount=0;
+            for (double[] c : result.circles) {
+                double wcx=offX+c[0]*scale, wcy=offY+c[1]*scale, wr=c[2]*scale;
+                shapeDAO.insert(new Shape("Circle"+(++circleCount), "Circle", new long[0],
+                        Math.PI*wr*wr, 2*Math.PI*wr, wcx+","+wcy+","+wr));
+            }
+
+            final int fn=insertedNodes.size(), fe=edgeCount, fs=shapeCount, fc=circleCount;
+            SwingUtilities.invokeLater(() -> {
+                // Open a completely separate workspace window — the caller's
+                // existing canvas/state is never touched.
+                WorkspaceFrame newWindow = new WorkspaceFrame();
+                newWindow.setTitle("GeoWorkspace — Imported: " + result.points.size() + " nodes");
+                newWindow.setVisible(true);
+
+                JOptionPane.showMessageDialog(newWindow,
+                    "Import complete!\n\n"+fn+" nodes  •  "+fe+" edges  •  "+fs+" shapes  •  "+fc+" circles\n\n"
+                    +"Opened in this new workspace window.\nYour previous workspace is untouched.",
+                    "Done", JOptionPane.INFORMATION_MESSAGE);
+
+                onDone.run();
+            });
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(parent,
+                "DB error: "+ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE));
+        }
+    }
+
+    private double snap(double v){ return Math.round(v/GRID)*GRID; }
+    private JButton dlgBtn(String t, Color bg) {
+        JButton b=new JButton(t); b.setFont(new Font("Consolas",Font.BOLD,11));
+        b.setForeground(Color.WHITE); b.setBackground(bg);
+        b.setBorderPainted(false); b.setFocusPainted(false); b.setOpaque(true);
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)); return b;
+    }
+
+    private static class ShapeCandidate {
+        final String type; final List<Integer> nodeIndices;
+        ShapeCandidate(String t, List<Integer> n){ type=t; nodeIndices=n; }
+    }
     private static class TraceResult {
-        final BufferedImage src;
-        final int w,h;
-        final List<int[]> lines,circles;
-        final List<double[]> points;
-        TraceResult(BufferedImage src,int w,int h,List<int[]>lines,List<int[]>circles,List<double[]>pts){
-            this.src=src;this.w=w;this.h=h;this.lines=lines;this.circles=circles;this.points=pts;}
+        final BufferedImage src; final int w, h;
+        final List<double[]> lines, circles, points;
+        final List<ShapeCandidate> shapes;
+        TraceResult(BufferedImage s,int w,int h,List<double[]>l,List<double[]>c,List<double[]>p,List<ShapeCandidate>sh){
+            src=s; this.w=w; this.h=h; lines=l; circles=c; points=p; shapes=sh;
+        }
     }
 }

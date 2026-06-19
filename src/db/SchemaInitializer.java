@@ -10,6 +10,7 @@ public class SchemaInitializer {
 
             stmt.execute("DROP TABLE IF EXISTS adjacency");
 
+            // Use IF NOT EXISTS so existing data is preserved across restarts
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS nodes (
                     id    IDENTITY PRIMARY KEY,

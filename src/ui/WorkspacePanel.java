@@ -92,6 +92,8 @@ public class WorkspacePanel extends JPanel {
     private double camX=0,camY=0,zoom=1.0,rotateDeg=0;
     private boolean rmbDragging=false;
     private int rmbStartX=0; private double rmbStartRot=0;
+    private int lmbPressX=0, lmbPressY=0;
+    private boolean lmbDragged=false;
 
     private Timer syncTimer;
 
@@ -460,12 +462,14 @@ public class WorkspacePanel extends JPanel {
             @Override public void mousePressed(MouseEvent e){
                 requestFocusInWindow();
                 if(SwingUtilities.isRightMouseButton(e)){ rmbStartX=e.getX(); rmbStartRot=rotateDeg; rmbDragging=false; }
-                // Circle: press starts center
-                if(SwingUtilities.isLeftMouseButton(e)&&activeMode==Mode.CIRCLE&&!circlePressed){
-                    circleCenter=toWorld(e.getX(),e.getY());
-                    circleCurrent=circleCenter;
-                    circlePressed=true;
-                    repaint();
+                if(SwingUtilities.isLeftMouseButton(e)){
+                    lmbPressX=e.getX(); lmbPressY=e.getY(); lmbDragged=false;
+                    if(activeMode==Mode.CIRCLE&&!circlePressed){
+                        circleCenter=toWorld(e.getX(),e.getY());
+                        circleCurrent=circleCenter;
+                        circlePressed=true;
+                        repaint();
+                    }
                 }
             }
             @Override public void mouseDragged(MouseEvent e){
@@ -474,22 +478,31 @@ public class WorkspacePanel extends JPanel {
                     if(Math.abs(dx)>4) rmbDragging=true;
                     if(rmbDragging){ rotateDeg=rmbStartRot+dx*0.30; repaint(); }
                 }
-                // Circle: drag sets radius live
-                if(SwingUtilities.isLeftMouseButton(e)&&activeMode==Mode.CIRCLE&&circlePressed){
-                    circleCurrent=toWorld(e.getX(),e.getY()); repaint();
+                if(SwingUtilities.isLeftMouseButton(e)){
+                    int dx=e.getX()-lmbPressX, dy=e.getY()-lmbPressY;
+                    if(Math.abs(dx)>4||Math.abs(dy)>4) lmbDragged=true;
+                    if(activeMode==Mode.CIRCLE&&circlePressed){
+                        circleCurrent=toWorld(e.getX(),e.getY()); repaint();
+                    }
                 }
             }
             @Override public void mouseReleased(MouseEvent e){
                 if(SwingUtilities.isRightMouseButton(e)&&!rmbDragging) showContextMenu(e);
                 rmbDragging=false;
-                // Circle: release commits
-                if(SwingUtilities.isLeftMouseButton(e)&&activeMode==Mode.CIRCLE&&circlePressed){
-                    circleCurrent=toWorld(e.getX(),e.getY());
-                    commitCircle(); repaint();
+                if(SwingUtilities.isLeftMouseButton(e)){
+                    if(activeMode==Mode.CIRCLE&&circlePressed){
+                        circleCurrent=toWorld(e.getX(),e.getY());
+                        commitCircle(); repaint();
+                    } else if(!lmbDragged){
+                        // Fire click logic on release — avoids mouseClicked being
+                        // suppressed by tiny mouse movement between press and release
+                        handleLeftClick(e);
+                    }
                 }
             }
             @Override public void mouseClicked(MouseEvent e){
-                if(SwingUtilities.isLeftMouseButton(e)&&activeMode!=Mode.CIRCLE) handleLeftClick(e);
+                // Intentionally empty — all LMB logic moved to mouseReleased above
+                // to fix the "click not registering if mouse moves slightly" bug.
             }
             @Override public void mouseMoved(MouseEvent e){
                 Point2D w=toWorld(e.getX(),e.getY());
@@ -669,7 +682,6 @@ public class WorkspacePanel extends JPanel {
     // intersectArea/subtractArea hold the actual overlapping/result region so it
     // can be drawn as a highlighted overlay (not just a scatter of crossing points).
     private Area intersectArea = null;
-    private Area subtractPreviewArea = null;
 
     public void boolIntersect(){
         if(boolShapes.size()<2){ warn("SHIFT+click inside 2 shapes on the canvas first."); return; }
@@ -689,56 +701,63 @@ public class WorkspacePanel extends JPanel {
 
     public void boolSubtract(){
         if(boolShapes.size()<2){ warn("SHIFT+click inside 2 shapes first."); return; }
-        Shape sA=boolShapes.get(0), sB=boolShapes.get(1);
-
-        // Let the user decide which shape loses the overlapping region
-        Object[] options = { "Subtract from "+sA.getLabel(), "Subtract from "+sB.getLabel() };
-        int choice = JOptionPane.showOptionDialog(this,
-            "Which shape should have the overlapping region removed?",
-            "Subtract — choose target", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE,
-            null, options, options[0]);
-        if (choice == JOptionPane.CLOSED_OPTION) return;
-
-        Shape target = (choice==0) ? sA : sB;
-        Shape other  = (choice==0) ? sB : sA;
-
-        Area targetArea = shapeToArea(target);
-        Area otherArea  = shapeToArea(other);
-        if (targetArea==null || otherArea==null){ warn("Could not build a region for one of the shapes."); return; }
-
-        Area result = new Area(targetArea);
-        result.subtract(otherArea);
-
-        if (result.equals(targetArea)) {
-            JOptionPane.showMessageDialog(this,"Shapes don't overlap — nothing to subtract.","Subtract",JOptionPane.INFORMATION_MESSAGE);
+        if(intersectArea==null||intersectArea.isEmpty()){
+            warn("Run INTERSECT first to highlight the overlapping region,\nthen SUBTRACT will remove that region.");
             return;
         }
 
-        if (JOptionPane.showConfirmDialog(this,
-                "Remove the overlapping region from "+target.getLabel()+"?\n"
-                +"This deletes "+target.getLabel()+" and replaces it with the trimmed region as a Free Polygon.",
-                "Confirm Subtract", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        Shape sA=boolShapes.get(0), sB=boolShapes.get(1);
+        Object[] options = { "Remove overlap from "+sA.getLabel(), "Remove overlap from "+sB.getLabel(), "Remove from BOTH" };
+        int choice = JOptionPane.showOptionDialog(this,
+            "The highlighted region will be permanently erased\nfrom whichever shape(s) you choose.\n\nBoth shapes remain in the DB — only their overlapping part is deleted.",
+            "Subtract — choose target", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE,
+            null, options, options[0]);
+        if(choice==JOptionPane.CLOSED_OPTION) return;
 
-        try {
-            // Persist the trimmed area as a new Free-Polygon shape, remove the old target shape
-            List<Node> newNodes = areaToNodes(result);
-            if (newNodes.size() < 3) {
-                JOptionPane.showMessageDialog(this,"Subtraction left too small a region to form a shape.","Subtract",JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-            long[] ids = new long[newNodes.size()];
-            for (int i=0;i<newNodes.size();i++) ids[i]=newNodes.get(i).getId();
-            double area = polygonArea(newNodes);
-            double perim = polygonPerimeter(newNodes);
-            for (int i=0;i<newNodes.size();i++) {
-                try { buildEdge(newNodes.get(i), newNodes.get((i+1)%newNodes.size())); } catch(Exception ignore){}
-            }
-            shapeDAO.insert(new Shape(target.getLabel()+" (trimmed)", "Free Polygon", ids, area, perim, ""));
-            shapeDAO.delete(target.getId());
+        // Determine which shapes to trim
+        List<Shape> targets = new ArrayList<>();
+        if(choice==0) targets.add(sA);
+        else if(choice==1) targets.add(sB);
+        else { targets.add(sA); targets.add(sB); }
 
-            boolShapes.clear(); intersectArea=null; subtractPreviewArea=null;
-            loadFromDB(); repaint();
-        } catch (Exception ex) { ex.printStackTrace(); }
+        boolean anyChanged = false;
+        for(Shape target : targets){
+            Area targetArea = shapeToArea(target);
+            if(targetArea==null) continue;
+            Area overlap = new Area(intersectArea); // the highlighted intersection
+            overlap.intersect(targetArea);
+            if(overlap.isEmpty()) continue;
+
+            // Find and delete edges of target whose MIDPOINT falls inside the overlap region
+            long[] nodeIds = target.getNodeIds();
+            if(nodeIds.length < 2) continue;
+            for(int i=0;i<nodeIds.length;i++){
+                Node na = findById(nodeIds[i]);
+                Node nb = findById(nodeIds[(i+1)%nodeIds.length]);
+                if(na==null||nb==null) continue;
+                double mx=(na.getX()+nb.getX())/2, my=(na.getY()+nb.getY())/2;
+                if(overlap.contains(mx,my)){
+                    try{
+                        edgeDAO.delete(na.getId(),nb.getId());
+                        nodeDAO.removeAdjacency(na.getId(),nb.getId());
+                        anyChanged=true;
+                    }catch(Exception ex){ ex.printStackTrace(); }
+                }
+            }
+        }
+
+        if(!anyChanged){
+            JOptionPane.showMessageDialog(this,
+                "No edges of the selected shape(s) pass through the intersection region.",
+                "Subtract",JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        // Clear intersection highlight — both original shapes remain in DB
+        intersectArea=null; intersectPts.clear();
+        boolShapes.clear();
+        if(rightPanel!=null) rightPanel.updateBoolCount(0);
+        loadFromDB(); repaint();
     }
 
     public void boolAdd(){
@@ -784,36 +803,6 @@ public class WorkspacePanel extends JPanel {
     }
 
     /** Flattens an Area's outline into an ordered list of DB-persisted nodes. */
-    private List<Node> areaToNodes(Area area) {
-        List<Node> result = new ArrayList<>();
-        java.awt.geom.PathIterator it = area.getPathIterator(null, 1.0);
-        double[] coords = new double[6];
-        try {
-            while (!it.isDone()) {
-                int type = it.currentSegment(coords);
-                if (type == java.awt.geom.PathIterator.SEG_MOVETO || type == java.awt.geom.PathIterator.SEG_LINETO) {
-                    double wx=snapD(coords[0]), wy=snapD(coords[1]);
-                    String label="X"+(nodes.size()+result.size()+1);
-                    Node n = nodeDAO.insert(new Node(wx, wy, label));
-                    result.add(n);
-                }
-                it.next();
-            }
-        } catch (Exception ex) { ex.printStackTrace(); }
-        return result;
-    }
-
-    private double polygonArea(List<Node> pts){
-        double a=0; int n=pts.size();
-        for(int i=0;i<n;i++){Node p=pts.get(i),q=pts.get((i+1)%n);a+=p.getX()*q.getY()-q.getX()*p.getY();}
-        return Math.abs(a)/2;
-    }
-    private double polygonPerimeter(List<Node> pts){
-        double p=0; int n=pts.size();
-        for(int i=0;i<n;i++){Node a=pts.get(i),b=pts.get((i+1)%n);p+=Math.hypot(b.getX()-a.getX(),b.getY()-a.getY());}
-        return p;
-    }
-
     private List<long[]> shapeEdgePairs(Shape s){
         List<long[]>pairs=new ArrayList<>();long[]ids=s.getNodeIds();
         if(ids.length<2) return pairs;
